@@ -1,76 +1,66 @@
 import fs from 'fs/promises';
+import chalk from 'chalk';
 
 /**
- * Extracts SEARCH/REPLACE blocks from LLM output.
- *
- * The block delimiter strands tolerate a leading or trailing newline so
- * sloppy model outputs still match (e.g. `<<<<<<< SEARCH` with a blank
- * line immediately after).
- */
-export function extractBlocks(text) {
-    if (typeof text !== 'string' || text.length === 0) return [];
-
-    const blockRegex = /<<<<<<< SEARCH\r?\n([\s\S]*?)\r?\n=======\r?\n([\s\S]*?)\r?\n>>>>>>> REPLACE/g;
-    const blocks = [];
-    let match;
-
-    while ((match = blockRegex.exec(text)) !== null) {
-        blocks.push({
-            search: match[1],
-            replace: match[2]
-        });
-    }
-    return blocks;
-}
-
-/**
- * Applies SEARCH/REPLACE blocks to a file on disk. Throws on I/O errors but
- * returns a structured `{ success, reason }` for any logical failure so the
- * caller can decide whether to retry, fall back to manual paste, etc.
+ * Parses and atomically applies multi-block SEARCH/REPLACE diff blocks.
+ * If any search segment fails to match uniquely, it rejects the entire file write pass.
  */
 export async function applyEdits(filePath, llmOutput) {
-    const blocks = extractBlocks(llmOutput);
+    let fileContent = '';
+    try {
+        fileContent = await fs.readFile(filePath, 'utf-8');
+    } catch (error) {
+        return { success: false, reason: `Could not open target file: ${error.message}` };
+    }
 
-    if (blocks.length === 0) {
-        return {
-            success: false,
-            reason: 'No valid SEARCH/REPLACE blocks found in output.'
-        };
+    // Explicit regex extraction for match blocks
+    const blockRegex = /<<<<<<< SEARCH([\s\S]*?)=======([\s\S]*?)>>>>>>> REPLACE/g;
+    const matches = [...llmOutput.matchAll(blockRegex)];
+
+    if (matches.length === 0) {
+        return { success: false, reason: 'No structural SEARCH/REPLACE blocks discovered in output stream.' };
+    }
+
+    let updatedContent = fileContent;
+    let blocksApplied = 0;
+
+    for (const match of matches) {
+        const searchBlock = match[1];
+        const replaceBlock = match[2];
+
+        // Normalize string endings to eliminate carriage return mismatches
+        const normalizedSearch = searchBlock.replace(/\r\n/g, '\n');
+        const normalizedContent = updatedContent.replace(/\r\n/g, '\n');
+
+        if (!normalizedSearch.trim()) {
+            // Context injection or pure additions
+            continue;
+        }
+
+        const matchIndex = normalizedContent.indexOf(normalizedSearch);
+        if (matchIndex === -1) {
+            return { 
+                success: false, 
+                reason: `Target search block content match criteria failed.` 
+            };
+        }
+
+        if (normalizedContent.indexOf(normalizedSearch, matchIndex + 1) !== -1) {
+            return { 
+                success: false, 
+                reason: `Ambiguous target reference. Multi-match ambiguity detected.` 
+            };
+        }
+
+        // Apply replacement slice line safely
+        updatedContent = normalizedContent.replace(normalizedSearch, replaceBlock.replace(/\r\n/g, '\n'));
+        blocksApplied++;
     }
 
     try {
-        const original = await fs.readFile(filePath, 'utf-8');
-
-        // Validate every block against the *original* content first. If any
-        // block doesn't match we refuse to write at all — this prevents a
-        // partial mutation followed by a retry that re-edits an already
-        // half-modified file.
-        const missing = [];
-        blocks.forEach((block, index) => {
-            if (!original.includes(block.search)) {
-                missing.push(`Block #${index + 1}: search text did not match any line in the file.`);
-            }
-        });
-        if (missing.length > 0) {
-            return { success: false, reason: missing.join(' ') };
-        }
-
-        // Apply atomically: every block matches, so build the final content
-        // by walking the blocks and replacing each first occurrence on the
-        // *original* snapshot — never on a midway-mutated string.
-        let content = original;
-        for (const block of blocks) {
-            content = content.replace(block.search, block.replace);
-        }
-
-        if (content === original) {
-            return { success: false, reason: 'Edits produced no textual change.' };
-        }
-
-        await fs.writeFile(filePath, content, 'utf-8');
-        return { success: true, blocksApplied: blocks.length };
-
+        await fs.writeFile(filePath, updatedContent, 'utf-8');
+        return { success: true, blocksApplied };
     } catch (error) {
-        return { success: false, reason: `File error: ${error.message}` };
+        return { success: false, reason: `File atomic sync write failure: ${error.message}` };
     }
 }

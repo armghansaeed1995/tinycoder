@@ -6,7 +6,7 @@ import { loadConfig } from './config/configManager.js';
 import { routeCommand } from './commands/handlers.js';
 import { readContextFile } from './fs/contextEditor.js';
 import { TINY_CONTEXT_FILE } from './constants.js';
-import { printBanner, printTip, printStatus } from './ui/terminal.js';
+import { printBanner, printTip, printStatus, printDivider } from './ui/terminal.js';
 import { isCancellation } from './utils.js';
 import { getAutocompleteChoices, makeSlashSuggest, COMMANDS } from './commands.js';
 
@@ -15,7 +15,7 @@ export async function runCli() {
 
     printBanner(
         '⚡ TinyCoder CLI',
-        'Fast, local, low-resource coding assistant.'
+        'Fast, local, low-resource coding assistant with Chained Execution Pipeline.'
     );
 
     printStatus(chalk.gray('•'), 'Initializing system configuration...');
@@ -91,6 +91,9 @@ export async function runCli() {
 
         try {
             await routeCommand(input, config);
+            console.log('');
+            printDivider(60);
+            console.log('');
         } catch (error) {
             console.error(chalk.red(`\nCommand failed: ${error?.message || error}`));
         }

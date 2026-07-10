@@ -17,7 +17,7 @@ export function printBanner(title, body = '', opts = {}) {
     const content = chalk.bold.cyan(title) + (body ? chalk.gray('\n' + body) : '');
     console.log(boxen(content, {
         padding: 1,
-        margin: 1,
+        margin: { top: 1, bottom: 1, left: 0, right: 0 },
         borderStyle: 'round',
         borderColor: 'cyan',
         ...opts
@@ -30,6 +30,7 @@ export function printBanner(title, body = '', opts = {}) {
 export function printTip(message) {
     console.log(boxen(chalk.yellow(message), {
         padding: 1,
+        margin: { top: 0, bottom: 1, left: 0, right: 0 },
         borderStyle: 'classic',
         borderColor: 'yellow'
     }));
@@ -54,9 +55,8 @@ export function printStatus(symbol, label, detail = '') {
 }
 
 /**
- * Print `key: value` for /settings-style dashboards. The label is colored
- * cyan and the value is emitted bold on the same line.
+ * Print `key: value` for /settings view dashboard layouts cleanly.
  */
 export function printKeyValue(key, value) {
-    console.log(`${chalk.cyan(key + ':')} ${chalk.bold(value)}`);
+    console.log(`  ${chalk.bold(key.padEnd(14))}: ${chalk.green(value)}`);
 }

@@ -7,7 +7,7 @@ import { getProjectFiles } from '../fs/fileExplorer.js';
 import { getCommandsByCategory } from '../commands.js';
 import { promptForFile } from '../ui/prompts.js';
 import { readContextFile, writeContextFile } from '../fs/contextEditor.js';
-import { executeWithRetry } from '../llm/api.js';
+import { executeWithRetry, streamLLM } from '../llm/api.js';
 import { saveGlobalConfig, isValidEndpoint, GLOBAL_CONFIG_PATH, normalizeEndpoint } from '../config/configManager.js';
 import { TINY_CONTEXT_FILE, TINY_PLAN_FILE } from '../constants.js';
 import { printDivider, printKeyValue } from '../ui/terminal.js';
@@ -70,8 +70,9 @@ export async function routeCommand(rawInput, config) {
 
 /**
  * Handles /code, /power, /ask, /review, and /test commands.
- * Editing roles (`code`, `power`) require a target file and run the
- * SEARCH/REPLACE pipeline; the chat-only roles skip both.
+ * Editing roles (`code`, `power`) run a deterministic two-step pipeline:
+ * 1. Silent Planning Pass to prevent logic errors and structural hallucinations.
+ * 2. Coding Pass backed by the newly formulated strategy.
  */
 async function handleCodingAndQA(action, promptText, config) {
     if (!promptText) {
@@ -106,11 +107,32 @@ async function handleCodingAndQA(action, promptText, config) {
     const tinyPlan = await readContextFile(TINY_PLAN_FILE) || '';
     const systemContextBlock = `\n---\n[${TINY_CONTEXT_FILE} Contents]\n${tinyContext}\n---\n[${TINY_PLAN_FILE} Contents]\n${tinyPlan}\n`.trim();
 
+    let executionPrompt = promptText;
+
+    // --- STEP 1: DETERMINISTIC SILENT PLANNING PIPELINE ---
+    if (!isChatOnly) {
+        const planModel = config.models.plan || 'llama3.2:1b';
+        process.stdout.write(chalk.cyan(`\n🧠 [Pipeline] Formulating implementation strategy with [${planModel}]... `));
+        
+        const internalPlanInstruction = `Analyze the target file and requirements. Write a brief, hyper-focused 3-bullet technical breakdown of the exact code replacements needed. Do not output code blocks. Prompt: ${promptText}`;
+        
+        const generatedPlan = await streamLLM(internalPlanInstruction, 'internal_planner', planModel, config.endpoint, systemContextBlock, true);
+        
+        if (generatedPlan && generatedPlan.trim()) {
+            console.log(chalk.green('📋 Strategy prepared successfully.'));
+            // Inject the crisp strategy plan directly into the next stage context window
+            executionPrompt = `Implementation Strategy Plan:\n${generatedPlan.trim()}\n\nOriginal Task Request:\n${promptText}`;
+        } else {
+            console.log(chalk.yellow('⚠️ Planning step timed out or returned empty. Falling back to direct execution.'));
+        }
+    }
+
+    // --- STEP 2: STABLE CODE EXECUTION GENERATION ---
     const modelToUse = config.models[action] || config.models.code;
-    console.log(chalk.gray(`Running [/${action}] using model: ${modelToUse}...`));
+    console.log(chalk.gray(`🚀 [Pipeline] Processing code implementation using model: ${modelToUse}...\n`));
 
     await executeWithRetry(
-        promptText,
+        executionPrompt,
         action,
         modelToUse,
         config.endpoint,
@@ -239,7 +261,6 @@ async function handleSettings(config) {
             if (success) {
                 console.log(chalk.green(`✔ Updated global role map: ${selectedRole} -> ${newModelName}`));
             } else {
-                // Roll back so the in-memory session matches what's still on disk.
                 config.models[selectedRole] = oldModel;
                 console.log(chalk.red(`✖ Could not persist model mapping change — nothing was saved. Check that ${GLOBAL_CONFIG_PATH} is writable.`));
             }
@@ -255,17 +276,11 @@ async function handleSettings(config) {
                 return;
             }
             const oldEndpoint = config.endpoint;
-            // Strip any trailing slashes the user may have typed so the
-            // in-memory value matches what sanitizeConfig will persist on
-            // disk; otherwise the running session concatenates
-            // endpoint + `/api/chat` with a stray double slash until restart.
-            // Same single source of truth as configManager.sanitizeConfig.
             config.endpoint = normalizeEndpoint(newEndpoint);
             const success = await saveGlobalConfig(config);
             if (success) {
                 console.log(chalk.green(`✔ Global Endpoint modified to ${config.endpoint}.`));
             } else {
-                // Roll back so the in-memory session matches what's still on disk.
                 config.endpoint = oldEndpoint;
                 console.log(chalk.red(`✖ Could not persist endpoint change — nothing was saved. Check that ${GLOBAL_CONFIG_PATH} is writable.`));
             }
@@ -282,14 +297,11 @@ async function handleSettings(config) {
             if (success) {
                 console.log(chalk.green(`✔ Default behavior mapped to /${config.defaultRole}`));
             } else {
-                // Roll back so the in-memory session matches what's still on disk.
                 config.defaultRole = oldDefaultRole;
                 console.log(chalk.red(`✖ Could not persist default role change — nothing was saved. Check that ${GLOBAL_CONFIG_PATH} is writable.`));
             }
         }
         else if (choice === 'exit') {
-            // Was previously a silent fall-through; users reported it looked
-            // like nothing happened when they picked "Back to terminal".
             console.log(chalk.gray('Returning to chat. Type /settings any time to come back.'));
         }
     } catch (e) {
@@ -303,8 +315,7 @@ async function handleSettings(config) {
 
 /**
  * Render the help screen grouped by category, driven entirely by the COMMANDS
- * registry in src/commands.js. Adding a new command there automatically adds
- * it to /help.
+ * registry in src/commands.js.
  */
 function displayHelp(config) {
     const groups = getCommandsByCategory();
@@ -336,4 +347,3 @@ function displayHelp(config) {
         { padding: 1, borderStyle: 'round', borderColor: 'cyan', title: 'Help', titleAlignment: 'center' }
     ));
 }
- 

@@ -23,6 +23,10 @@ When writing code, use the strict SEARCH/REPLACE block format:
 ...
 >>>>>>> REPLACE`,
 
+    internal_planner: `You are an architectural strategist routing steps inside a chained application compilation line.
+Break down the requested update into exactly 3 technical, clear bullet points describing which logic or functions to replace.
+Be dense, direct, and explicit. Do not provide code examples or markdown backticks.`,
+
     gather: `You are a Context Gatherer. Your job is to read the provided directory structure and high-level configuration.
 Output a clear, concise Markdown document outlining the project architecture, tech stack, and primary entry points.
 Do not write any code. Focus strictly on system structure.`,

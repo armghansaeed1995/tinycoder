@@ -20,8 +20,7 @@ const MAX_BUFFER_BYTES = 5 * 1024 * 1024; // 5 MiB
  * Returns the full response text or `null` on failure.
  *
  * @param {boolean} [silent=false] When true, tokens are buffered but not
- *   written to stdout. Used by the auto-retry path so a failed retry doesn't
- *   double-print to the terminal.
+ * written to stdout. Used by the auto-retry path and pipeline planning phase.
  */
 export async function streamLLM(prompt, role, model, endpoint, contextFiles = '', silent = false) {
     const systemPrompt = SYSTEM_PROMPTS[role] || SYSTEM_PROMPTS.code;
@@ -36,11 +35,9 @@ export async function streamLLM(prompt, role, model, endpoint, contextFiles = ''
 /**
  * The core streaming engine using native fetch. Wraps the request in an
  * AbortController so a stalled backend cannot hang the CLI forever.
- *
- * If `silent` is true, the tokens are *not* written to stdout (useful for
- * the auto-retry path that already streams the first attempt).
  */
-async function executeStream(messages, model, endpoint, silent = false) {    let fullResponse = '';
+async function executeStream(messages, model, endpoint, silent = false) {
+    let fullResponse = '';
     let bufferBytes = 0;
     let bufferExceeded = false;
     const controller = new AbortController();
@@ -81,7 +78,9 @@ async function executeStream(messages, model, endpoint, silent = false) {    let
                     if (!token) continue;
                     fullResponse += token;
                     bufferBytes += Buffer.byteLength(token, 'utf8');
+                    
                     if (!silent) process.stdout.write(chalk.green(token));
+                    
                     if (silent && bufferBytes >= MAX_BUFFER_BYTES) {
                         bufferExceeded = true;
                         controller.abort();
@@ -93,7 +92,6 @@ async function executeStream(messages, model, endpoint, silent = false) {    let
             }
         }
 
-        // Flush any tail bytes the decoder was holding.
         const tail = decoder.decode();
         if (tail) {
             fullResponse += tail;
@@ -119,14 +117,11 @@ async function executeStream(messages, model, endpoint, silent = false) {    let
 
 /**
  * Wraps the stream and handles the 1-time automated format retry logic.
- * For editing roles it attempts to apply the SEARCH/REPLACE patches; if
- * the model produced malformed output, it asks once more, then gracefully
- * falls back to letting the user copy/paste from the printed terminal output.
  */
 export async function executeWithRetry(prompt, role, model, endpoint, filePath, contextFiles) {
     let output = await streamLLM(prompt, role, model, endpoint, contextFiles);
 
-    if (output === null) return null; // Connection failed; nothing to retry.
+    if (output === null) return null;
 
     if (EDITING_ROLES.has(role) && filePath) {
         const firstAttempt = await applyEdits(filePath, output);
@@ -142,10 +137,6 @@ export async function executeWithRetry(prompt, role, model, endpoint, filePath, 
             `You MUST respond using ONLY the <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE block format. ` +
             `Wrap each edit in its own block. Here is the original request again: ${prompt}`;
 
-        // Stream the retry silently so the terminal isn't cluttered with a
-        // second copy of the model's regeneration. If the retry succeeds the
-        // success line is printed after; if it fails we fall back to letting
-        // the user paste.
         const retried = await streamLLM(retryPrompt, role, model, endpoint, contextFiles, true);
         if (retried === null) {
             console.error(chalk.red('\n[Error]: Could not reach the LLM for the retry. Output above is what was already streamed.'));
@@ -158,8 +149,6 @@ export async function executeWithRetry(prompt, role, model, endpoint, filePath, 
             return retried;
         }
 
-        // Silent retry didn't apply — print its output now so the user can
-        // copy/paste it manually (matches the README's stated fallback).
         console.log(chalk.gray('\n--- Model retry output (manual paste) ---'));
         console.log(chalk.gray(retried));
         console.log(chalk.red(`\n[Error]: Model failed format twice (${secondAttempt.reason}). See block above — copy and apply manually.`));

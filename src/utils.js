@@ -6,15 +6,14 @@
 
 /**
  * Heuristic check for an Enquirer cancellation. Covers every sentinel the
- * library actually throws when the user hits Ctrl+C:
- *   - any falsy value (`null`, `undefined`, `''`, `0`, `false`)
- *   - a non-Error empty/whitespace string
- *   - an `Error` whose `message` is `'canceled'`
- *   - an `Error` whose `name` is `'CanceledError'` or `'AbortError'`
- *     (AbortController-style aborts)
+ * library actually throws when the user hits Ctrl+C or cancels an input:
+ * - any falsy value (`null`, `undefined`, `''`, `0`, `false`)
+ * - a non-Error empty/whitespace string
+ * - an `Error` whose `message` is `'canceled'`
+ * - an `Error` whose `name` is `'CanceledError'` or `'AbortError'`
+ * (AbortController-style aborts)
  *
  * Returns `true` if the value looks like a cancellation, `false` otherwise.
- * Future cancel-sources (numeric status codes, etc.) should be added here.
  */
 export function isCancellation(error) {
     if (!error) return true;
