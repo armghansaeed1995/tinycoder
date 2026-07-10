@@ -8,7 +8,7 @@ import { getCommandsByCategory } from '../commands.js';
 import { promptForFile } from '../ui/prompts.js';
 import { readContextFile, writeContextFile } from '../fs/contextEditor.js';
 import { executeWithRetry } from '../llm/api.js';
-import { saveGlobalConfig, isValidEndpoint } from '../config/configManager.js';
+import { saveGlobalConfig, isValidEndpoint, GLOBAL_CONFIG_PATH, normalizeEndpoint } from '../config/configManager.js';
 import { TINY_CONTEXT_FILE, TINY_PLAN_FILE } from '../constants.js';
 import { printDivider, printKeyValue } from '../ui/terminal.js';
 import { isCancellation } from '../utils.js';
@@ -233,9 +233,16 @@ async function handleSettings(config) {
                 console.log(chalk.yellow('Model name cannot be empty — no change made.'));
                 return;
             }
+            const oldModel = config.models[selectedRole];
             config.models[selectedRole] = newModelName;
             const success = await saveGlobalConfig(config);
-            if (success) console.log(chalk.green(`✔ Updated global role map: ${selectedRole} -> ${newModelName}`));
+            if (success) {
+                console.log(chalk.green(`✔ Updated global role map: ${selectedRole} -> ${newModelName}`));
+            } else {
+                // Roll back so the in-memory session matches what's still on disk.
+                config.models[selectedRole] = oldModel;
+                console.log(chalk.red(`✖ Could not persist model mapping change — nothing was saved. Check that ${GLOBAL_CONFIG_PATH} is writable.`));
+            }
         }
         else if (choice === 'changeEndpoint') {
             const urlInput = new Input({
@@ -247,9 +254,21 @@ async function handleSettings(config) {
                 console.log(chalk.yellow("That doesn't look like an http(s) URL — no change made."));
                 return;
             }
-            config.endpoint = newEndpoint;
-            await saveGlobalConfig(config);
-            console.log(chalk.green(`✔ Global Endpoint modified to ${newEndpoint}.`));
+            const oldEndpoint = config.endpoint;
+            // Strip any trailing slashes the user may have typed so the
+            // in-memory value matches what sanitizeConfig will persist on
+            // disk; otherwise the running session concatenates
+            // endpoint + `/api/chat` with a stray double slash until restart.
+            // Same single source of truth as configManager.sanitizeConfig.
+            config.endpoint = normalizeEndpoint(newEndpoint);
+            const success = await saveGlobalConfig(config);
+            if (success) {
+                console.log(chalk.green(`✔ Global Endpoint modified to ${config.endpoint}.`));
+            } else {
+                // Roll back so the in-memory session matches what's still on disk.
+                config.endpoint = oldEndpoint;
+                console.log(chalk.red(`✖ Could not persist endpoint change — nothing was saved. Check that ${GLOBAL_CONFIG_PATH} is writable.`));
+            }
         }
         else if (choice === 'changeDefault') {
             const defMenu = new Select({
@@ -257,9 +276,21 @@ async function handleSettings(config) {
                 message: 'Select your default direct prompt fallback role:',
                 choices: ['code', 'power', 'ask']
             });
+            const oldDefaultRole = config.defaultRole;
             config.defaultRole = await defMenu.run();
-            await saveGlobalConfig(config);
-            console.log(chalk.green(`✔ Default behavior mapped to /${config.defaultRole}`));
+            const success = await saveGlobalConfig(config);
+            if (success) {
+                console.log(chalk.green(`✔ Default behavior mapped to /${config.defaultRole}`));
+            } else {
+                // Roll back so the in-memory session matches what's still on disk.
+                config.defaultRole = oldDefaultRole;
+                console.log(chalk.red(`✖ Could not persist default role change — nothing was saved. Check that ${GLOBAL_CONFIG_PATH} is writable.`));
+            }
+        }
+        else if (choice === 'exit') {
+            // Was previously a silent fall-through; users reported it looked
+            // like nothing happened when they picked "Back to terminal".
+            console.log(chalk.gray('Returning to chat. Type /settings any time to come back.'));
         }
     } catch (e) {
         if (isCancellation(e)) {

@@ -12,14 +12,17 @@ import {
 } from '../constants.js';
 
 const GLOBAL_CONFIG_DIR = path.join(os.homedir(), '.config', GLOBAL_CONFIG_DIR_NAME);
-const GLOBAL_CONFIG_PATH = path.join(GLOBAL_CONFIG_DIR, GLOBAL_CONFIG_FILENAME);
+// Exported so /settings failure messages can point the user at the exact
+// file rather than re-deriving the path on the other side of the import
+// boundary.
+export const GLOBAL_CONFIG_PATH = path.join(GLOBAL_CONFIG_DIR, GLOBAL_CONFIG_FILENAME);
 const LOCAL_CONFIG_PATH = path.join(process.cwd(), LOCAL_CONFIG_FILENAME);
 
 /**
  * Strip a single trailing slash from a URL so we never produce
  * `http://host/api//chat` when concatenating routes.
  */
-function normalizeEndpoint(endpoint) {
+export function normalizeEndpoint(endpoint) {
     if (typeof endpoint !== 'string') return DEFAULT_ENDPOINT;
     return endpoint.replace(/\/+$/, '');
 }
