@@ -1,4 +1,3 @@
-```markdown
 # ⚡ Tiny Coder CLI (`tinycoder`)
 
 A lightning-fast, zero-overhead, highly localized terminal coding companion tailored strictly for resource-constrained systems. Unlike bulky autonomous agents that consume massive token cycles, `tinycoder` operates on a strict, direct-action request/response model optimized to turn small, 1–2B parameter models (like `Qwen2.5-Coder:1.5b` or `Llama3.2:1b`) into precision development tools.
