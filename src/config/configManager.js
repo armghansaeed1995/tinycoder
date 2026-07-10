@@ -3,24 +3,63 @@ import path from 'path';
 import os from 'os';
 import chalk from 'chalk';
 
-const GLOBAL_CONFIG_DIR = path.join(os.homedir(), '.config', 'tinycoder');
-const GLOBAL_CONFIG_PATH = path.join(GLOBAL_CONFIG_DIR, 'config.json');
-const LOCAL_CONFIG_PATH = path.join(process.cwd(), 'tinycoder.json');
+import {
+    GLOBAL_CONFIG_DIR_NAME,
+    GLOBAL_CONFIG_FILENAME,
+    LOCAL_CONFIG_FILENAME,
+    DEFAULT_CONFIG,
+    DEFAULT_ENDPOINT
+} from '../constants.js';
 
-// Default settings optimized for 1-2B local models via Ollama
-const DEFAULT_CONFIG = {
-    endpoint: "http://127.0.0.1:11434/api",
-    defaultRole: "code",
-    models: {
-        code: "qwen2.5-coder:1.5b",
-        power: "qwen2.5-coder:7b", // An optional larger model for heavy tasks
-        gather: "llama3.2:1b",
-        plan: "llama3.2:1b",
-        ask: "llama3.2:1b",
-        review: "qwen2.5-coder:1.5b",
-        test: "qwen2.5-coder:1.5b"
+const GLOBAL_CONFIG_DIR = path.join(os.homedir(), '.config', GLOBAL_CONFIG_DIR_NAME);
+const GLOBAL_CONFIG_PATH = path.join(GLOBAL_CONFIG_DIR, GLOBAL_CONFIG_FILENAME);
+const LOCAL_CONFIG_PATH = path.join(process.cwd(), LOCAL_CONFIG_FILENAME);
+
+/**
+ * Strip a single trailing slash from a URL so we never produce
+ * `http://host/api//chat` when concatenating routes.
+ */
+function normalizeEndpoint(endpoint) {
+    if (typeof endpoint !== 'string') return DEFAULT_ENDPOINT;
+    return endpoint.replace(/\/+$/, '');
+}
+
+/**
+ * Validate that a parsed config has the shape we expect, falling back to
+ * defaults for any missing or malformed pieces. This avoids one bad key
+ * taking down the whole CLI.
+ */
+function sanitizeConfig(raw) {
+    const safe = { ...DEFAULT_CONFIG, models: { ...DEFAULT_CONFIG.models } };
+
+    if (raw && typeof raw === 'object') {
+        if (typeof raw.endpoint === 'string' && raw.endpoint.length > 0) {
+            safe.endpoint = normalizeEndpoint(raw.endpoint);
+        }
+        if (typeof raw.defaultRole === 'string' && raw.defaultRole.length > 0) {
+            safe.defaultRole = raw.defaultRole;
+        }
+        if (raw.models && typeof raw.models === 'object') {
+            for (const [role, model] of Object.entries(raw.models)) {
+                if (typeof model === 'string' && model.length > 0) {
+                    safe.models[role] = model;
+                }
+            }
+        }
     }
-};
+
+    return safe;
+}
+
+/**
+ * Quick URL validator (best-effort). We only check that the value looks
+ * like `http://...` or `https://...`. The LLM endpoint will be exercised
+ * fully on the next request.
+ */
+export function isValidEndpoint(endpoint) {
+    if (typeof endpoint !== 'string') return false;
+    return /^https?:\/\/.+/i.test(endpoint.trim());
+}
 
 /**
  * Ensures the global configuration directory and file exist.
@@ -41,28 +80,37 @@ async function ensureGlobalConfig() {
 }
 
 /**
+ * Reads a config file and returns its parsed JSON.
+ * Throws on read or parse errors; callers decide how loud to be.
+ */
+async function readConfigFile(filePath) {
+    const data = await fs.readFile(filePath, 'utf-8');
+    return JSON.parse(data);
+}
+
+/**
  * Loads and merges configurations.
  * Priority: Local tinycoder.json > Global ~/.config/tinycoder/config.json > Defaults
  */
 export async function loadConfig() {
     await ensureGlobalConfig();
 
-    let config = { ...DEFAULT_CONFIG };
+    let config = sanitizeConfig(DEFAULT_CONFIG);
 
     // 1. Load Global Config
     try {
-        const globalData = await fs.readFile(GLOBAL_CONFIG_PATH, 'utf-8');
-        const globalConfig = JSON.parse(globalData);
-        config = { ...config, ...globalConfig, models: { ...config.models, ...globalConfig.models } };
+        const globalConfig = await readConfigFile(GLOBAL_CONFIG_PATH);
+        config = sanitizeConfig({ ...config, ...globalConfig });
     } catch (error) {
-        console.error(chalk.red(`\n[Warning] Failed to parse global config: ${error.message}`));
+        if (error.code !== 'ENOENT') {
+            console.error(chalk.red(`\n[Warning] Failed to parse global config: ${error.message}`));
+        }
     }
 
     // 2. Load Local Config (if it exists in the current project directory)
     try {
-        const localData = await fs.readFile(LOCAL_CONFIG_PATH, 'utf-8');
-        const localConfig = JSON.parse(localData);
-        config = { ...config, ...localConfig, models: { ...config.models, ...localConfig.models } };
+        const localConfig = await readConfigFile(LOCAL_CONFIG_PATH);
+        config = sanitizeConfig({ ...config, ...localConfig });
     } catch (error) {
         // Silently ignore if no local config exists, this is expected behavior
         if (error.code !== 'ENOENT') {
@@ -75,12 +123,14 @@ export async function loadConfig() {
 
 /**
  * Updates and saves the global configuration.
- * Used by the /settings command.
+ * Used by the /settings command. Endpoint URLs are normalized before saving
+ * to guarantee consistent URL composition downstream.
  */
 export async function saveGlobalConfig(newConfig) {
     await ensureGlobalConfig();
     try {
-        await fs.writeFile(GLOBAL_CONFIG_PATH, JSON.stringify(newConfig, null, 4));
+        const safeConfig = sanitizeConfig(newConfig);
+        await fs.writeFile(GLOBAL_CONFIG_PATH, JSON.stringify(safeConfig, null, 4));
         return true;
     } catch (error) {
         console.error(chalk.red(`\n[Error] Could not save settings: ${error.message}`));

@@ -1,24 +1,42 @@
 import chalk from 'chalk';
+import boxen from 'boxen';
 import pkg from 'enquirer';
 const { Select, Input } = pkg;
 
 import { getProjectFiles } from '../fs/fileExplorer.js';
+import { getCommandsByCategory } from '../commands.js';
 import { promptForFile } from '../ui/prompts.js';
 import { readContextFile, writeContextFile } from '../fs/contextEditor.js';
 import { executeWithRetry } from '../llm/api.js';
-import { saveGlobalConfig } from '../config/configManager.js';
+import { saveGlobalConfig, isValidEndpoint } from '../config/configManager.js';
+import { TINY_CONTEXT_FILE, TINY_PLAN_FILE } from '../constants.js';
+import { printDivider, printKeyValue } from '../ui/terminal.js';
+import { isCancellation } from '../utils.js';
+
+/** Roles that stream prose but never auto-apply SEARCH/REPLACE patches. */
+const CHAT_ONLY_ROLES = new Set(['ask', 'review', 'test']);
 
 /**
  * Main command router for TinyCoder
  */
 export async function routeCommand(rawInput, config) {
-    const args = rawInput.trim().split(' ');
+    const trimmed = rawInput.trim();
+    const args = trimmed.split(/\s+/);
     let command = args[0].toLowerCase();
     let promptText = args.slice(1).join(' ');
 
+    // Bare "/" is a strong "show me everything" gesture now that the
+    // dropdown advertises it. Short-circuit BEFORE the default-role rewrite
+    // so / is *only* ever interpreted as a slash command, never as a
+    // free-text default-role prompt.
+    if (trimmed === '/') {
+        displayHelp(config);
+        return;
+    }
+
     // If the input didn't start with a slash, it defaults to the user's default role
     if (!command.startsWith('/')) {
-        promptText = rawInput;
+        promptText = trimmed || '';
         command = `/${config.defaultRole || 'code'}`;
     }
 
@@ -27,7 +45,7 @@ export async function routeCommand(rawInput, config) {
 
     switch (action) {
         case 'help':
-            displayHelp();
+            displayHelp(config);
             break;
         case 'settings':
             await handleSettings(config);
@@ -51,7 +69,9 @@ export async function routeCommand(rawInput, config) {
 }
 
 /**
- * Handles /code, /power, /ask, /review, and /test commands
+ * Handles /code, /power, /ask, /review, and /test commands.
+ * Editing roles (`code`, `power`) require a target file and run the
+ * SEARCH/REPLACE pipeline; the chat-only roles skip both.
  */
 async function handleCodingAndQA(action, promptText, config) {
     if (!promptText) {
@@ -59,35 +79,32 @@ async function handleCodingAndQA(action, promptText, config) {
         return;
     }
 
+    const isChatOnly = CHAT_ONLY_ROLES.has(action);
     let targetFilePath = null;
-    
-    // For roles that alter or highly inspect files, pick a file via fuzzy search
-    if (action !== 'ask') {
+
+    if (!isChatOnly) {
         try {
             const files = await getProjectFiles();
             if (files.length === 0) {
-                console.log(chalk.yellow("No files found in the current directory tree. Proceeding strictly as chat."));
+                console.log(chalk.yellow('No files found in the current directory tree. Proceeding strictly as chat.'));
             } else {
                 targetFilePath = await promptForFile(files);
-                console.log(chalk.gray(`Target file locked: ${targetFilePath}`));
-                promptText = `Target File: ${targetFilePath}\n\nUser Request: ${promptText}`;
+                if (!targetFilePath) {
+                    console.log(chalk.gray('File selection skipped or cancelled. Proceeding as generic prompt.'));
+                } else {
+                    console.log(chalk.gray(`Target file locked: ${targetFilePath}`));
+                    promptText = `Target File: ${targetFilePath}\n\nUser Request: ${promptText}`;
+                }
             }
         } catch (e) {
-            console.log(chalk.gray("File selection skipped or cancelled. Proceeding as generic prompt."));
+            console.log(chalk.gray('File selection skipped or cancelled. Proceeding as generic prompt.'));
         }
     }
 
-    // Build context strings from optional local Markdown files if present
-    const tinyContext = await readContextFile('TINYCONTEXT.md') || '';
-    const tinyPlan = await readContextFile('TINYPLAN.md') || '';
-    const systemContextBlock = `
----
-[TINYCONTEXT.md Contents]
-${tinyContext}
----
-[TINYPLAN.md Contents]
-${tinyPlan}
-`.trim();
+    // Build context strings from optional local Markdown files if present.
+    const tinyContext = await readContextFile(TINY_CONTEXT_FILE) || '';
+    const tinyPlan = await readContextFile(TINY_PLAN_FILE) || '';
+    const systemContextBlock = `\n---\n[${TINY_CONTEXT_FILE} Contents]\n${tinyContext}\n---\n[${TINY_PLAN_FILE} Contents]\n${tinyPlan}\n`.trim();
 
     const modelToUse = config.models[action] || config.models.code;
     console.log(chalk.gray(`Running [/${action}] using model: ${modelToUse}...`));
@@ -106,27 +123,35 @@ ${tinyPlan}
  * Handles /gather - Context Gatherer
  */
 async function handleGatherContext(promptText, config) {
-    console.log(chalk.gray("Scanning local directory structure and configuration files..."));
-    
-    const files = await getProjectFiles();
-    let directoryTree = files.join('\n');
-    let packageJsonSnippet = "";
+    console.log(chalk.gray('Scanning local directory structure and configuration files...'));
 
+    let files = [];
     try {
-        packageJsonSnippet = await readContextFile('package.json') || "";
-        if (packageJsonSnippet) {
-            packageJsonSnippet = `\n\n[package.json]:\n${packageJsonSnippet}`;
+        files = await getProjectFiles();
+    } catch (e) {
+        console.error(chalk.red(`[Error] Could not scan project files: ${e.message}`));
+        return;
+    }
+    const directoryTree = files.join('\n');
+
+    let packageJsonSnippet = '';
+    try {
+        const packageJson = await readContextFile('package.json');
+        if (packageJson) {
+            packageJsonSnippet = `\n\n[package.json]:\n${packageJson}`;
         }
-    } catch { /* ignore */ }
+    } catch {
+        // No package.json — perfectly fine not every project has one.
+    }
 
     const instruction = `Generate a structural configuration overview for the following file tree. ${promptText}\n\nFiles:\n${directoryTree}${packageJsonSnippet}`;
     const modelToUse = config.models.gather;
 
     console.log(chalk.gray(`Running [/gather] context processing engine with ${modelToUse}...`));
-    const output = await executeWithRetry(instruction, 'gather', modelToUse, config.endpoint, null, "");
+    const output = await executeWithRetry(instruction, 'gather', modelToUse, config.endpoint, null, '');
 
     if (output) {
-        await writeContextFile('TINYCONTEXT.md', output);
+        await writeContextFile(TINY_CONTEXT_FILE, output);
     }
 }
 
@@ -135,11 +160,11 @@ async function handleGatherContext(promptText, config) {
  */
 async function handlePlanning(promptText, config) {
     if (!promptText) {
-        console.log(chalk.yellow("Please describe what you want to plan. Example: /plan Implement JWT Auth"));
+        console.log(chalk.yellow('Please describe what you want to plan. Example: /plan Implement JWT Auth'));
         return;
     }
 
-    const tinyContext = await readContextFile('TINYCONTEXT.md') || 'No context generated yet.';
+    const tinyContext = await readContextFile(TINY_CONTEXT_FILE) || 'No context generated yet.';
     const instruction = `Create a strict structural step-by-step feature build plan for: ${promptText}`;
     const modelToUse = config.models.plan;
 
@@ -147,7 +172,7 @@ async function handlePlanning(promptText, config) {
     const output = await executeWithRetry(instruction, 'plan', modelToUse, config.endpoint, null, tinyContext);
 
     if (output) {
-        await writeContextFile('TINYPLAN.md', output);
+        await writeContextFile(TINY_PLAN_FILE, output);
     }
 }
 
@@ -156,9 +181,10 @@ async function handlePlanning(promptText, config) {
  */
 async function handleSettings(config) {
     console.log(chalk.bold.cyan('\n--- TinyCoder Settings Dashboard ---'));
-    console.log(chalk.gray(`Endpoint: ${config.endpoint}`));
-    console.log(chalk.gray(`Default Command: /${config.defaultRole}\n`));
-    
+    printKeyValue('Endpoint', config.endpoint);
+    printKeyValue('Default', `/${config.defaultRole}`);
+    printDivider();
+
     const menu = new Select({
         name: 'action',
         message: 'What would you like to modify?',
@@ -171,71 +197,112 @@ async function handleSettings(config) {
         ]
     });
 
-    const choice = await menu.run();
-
-    if (choice === 'view') {
-        console.log(chalk.cyan('\nCurrent Models Configured per Role:'));
-        Object.entries(config.models).forEach(([role, model]) => {
-            console.log(`  ${chalk.bold(role.padEnd(10))}: ${chalk.green(model)}`);
-        });
-        console.log('');
-    } 
-    
-    else if (choice === 'changeModel') {
-        const roleMenu = new Select({
-            name: 'role',
-            message: 'Select the role you want to map:',
-            choices: Object.keys(config.models)
-        });
-        const selectedRole = await roleMenu.run();
-
-        const modelInput = new Input({
-            message: `Enter the model string for [${selectedRole}] (e.g. llama3.2:1b):`,
-            initial: config.models[selectedRole]
-        });
-        const newModelName = await modelInput.run();
-
-        config.models[selectedRole] = newModelName.trim();
-        const success = await saveGlobalConfig(config);
-        if (success) console.log(chalk.green(`✔ Updated global role map: ${selectedRole} -> ${newModelName}`));
-    } 
-    
-    else if (choice === 'changeEndpoint') {
-        const urlInput = new Input({
-            message: 'Enter your OpenAI-compatible base endpoint:',
-            initial: config.endpoint
-        });
-        config.endpoint = (await urlInput.run()).trim();
-        await saveGlobalConfig(config);
-        console.log(chalk.green(`✔ Global Endpoint modified.`));
+    let choice;
+    try {
+        choice = await menu.run();
+    } catch (e) {
+        if (isCancellation(e)) {
+            console.log(chalk.gray('\nCancelled.'));
+            return;
+        }
+        throw e;
     }
 
-    else if (choice === 'changeDefault') {
-        const defMenu = new Select({
-            name: 'defaultRole',
-            message: 'Select your default direct prompt fallback role:',
-            choices: ['code', 'power', 'ask']
-        });
-        config.defaultRole = await defMenu.run();
-        await saveGlobalConfig(config);
-        console.log(chalk.green(`✔ Default behavior mapped to /${config.defaultRole}`));
+    try {
+        if (choice === 'view') {
+            console.log(chalk.cyan('\nCurrent Models Configured per Role:'));
+            Object.entries(config.models).forEach(([role, model]) => {
+                console.log(`  ${chalk.bold(role.padEnd(10))}: ${chalk.green(model)}`);
+            });
+            console.log('');
+        }
+        else if (choice === 'changeModel') {
+            const roleMenu = new Select({
+                name: 'role',
+                message: 'Select the role you want to map:',
+                choices: Object.keys(config.models)
+            });
+            const selectedRole = await roleMenu.run();
+
+            const modelInput = new Input({
+                message: `Enter the model string for [${selectedRole}] (e.g. llama3.2:1b):`,
+                initial: config.models[selectedRole]
+            });
+            const newModelName = (await modelInput.run()).trim();
+            if (!newModelName) {
+                console.log(chalk.yellow('Model name cannot be empty — no change made.'));
+                return;
+            }
+            config.models[selectedRole] = newModelName;
+            const success = await saveGlobalConfig(config);
+            if (success) console.log(chalk.green(`✔ Updated global role map: ${selectedRole} -> ${newModelName}`));
+        }
+        else if (choice === 'changeEndpoint') {
+            const urlInput = new Input({
+                message: 'Enter your OpenAI-compatible base endpoint:',
+                initial: config.endpoint
+            });
+            const newEndpoint = (await urlInput.run()).trim();
+            if (!isValidEndpoint(newEndpoint)) {
+                console.log(chalk.yellow("That doesn't look like an http(s) URL — no change made."));
+                return;
+            }
+            config.endpoint = newEndpoint;
+            await saveGlobalConfig(config);
+            console.log(chalk.green(`✔ Global Endpoint modified to ${newEndpoint}.`));
+        }
+        else if (choice === 'changeDefault') {
+            const defMenu = new Select({
+                name: 'defaultRole',
+                message: 'Select your default direct prompt fallback role:',
+                choices: ['code', 'power', 'ask']
+            });
+            config.defaultRole = await defMenu.run();
+            await saveGlobalConfig(config);
+            console.log(chalk.green(`✔ Default behavior mapped to /${config.defaultRole}`));
+        }
+    } catch (e) {
+        if (isCancellation(e)) {
+            console.log(chalk.gray('\nCancelled.'));
+            return;
+        }
+        console.error(chalk.red(`[Error] Settings change failed: ${e.message}`));
     }
 }
 
-function displayHelp() {
-    console.log(boxen(`
-${chalk.bold.cyan('Available Manual Commands:')}
-  ${chalk.bold('/code <prompt>')}   - General coding context workflow (Default)
-  ${chalk.bold('/power <prompt>')}  - Complex logic optimization with larger model
-  ${chalk.bold('/gather')}          - Examines local setup and creates/updates ${chalk.underline('TINYCONTEXT.md')}
-  ${chalk.bold('/plan <prompt>')}   - Breaks down goals down into ${chalk.underline('TINYPLAN.md')} task lists
-  ${chalk.bold('/ask <prompt>')}    - Strictly Chat/Q&A mode. No code editing parameters
-  ${chalk.bold('/review')}          - Evaluates a target file for syntax bugs and issues
-  ${chalk.bold('/test')}            - Generates unit tests automatically for targeted files
-  
-${chalk.bold.cyan('System Operations:')}
-  ${chalk.bold('/settings')}        - Real-time interaction dashboard for local models/endpoints
-  ${chalk.bold('/help')}            - Displays this command reference overview
-  ${chalk.bold('/exit')}            - Safely breaks the processing session loop
-    `, { padding: 1, borderStyle: 'single', borderColor: 'gray' }));
+/**
+ * Render the help screen grouped by category, driven entirely by the COMMANDS
+ * registry in src/commands.js. Adding a new command there automatically adds
+ * it to /help.
+ */
+function displayHelp(config) {
+    const groups = getCommandsByCategory();
+    const sections = [];
+    for (const [category, cmds] of groups) {
+        const lines = cmds.map(cmd => {
+            const label = cmd.name.padEnd(12);
+            return `  ${chalk.bold(label)} ${chalk.gray(cmd.description)}`;
+        });
+        sections.push(chalk.bold.cyan(category.toUpperCase()) + '\n' + lines.join('\n'));
+    }
+
+    const header = chalk.bold.cyan('⚡ TinyCoder Commands');
+    const defaultRole = config?.defaultRole ? `/${config.defaultRole}` : '/code';
+    const footer = chalk.gray(
+        '\n\nHow it works' +
+        chalk.bold(':') +
+        '\n  • ' + chalk.bold('Type /') + ' to open the live dropdown. Arrow + Enter picks a single-word verb like /help or /exit.' +
+        '\n  • For commands that take a prompt body (' +
+        chalk.cyan('/code, /plan, /ask, /review, /test, /power') +
+        ') type the FULL string — e.g. ' +
+        chalk.cyan('/code fix the navigation bug') +
+        ' — and press Enter. The raw line is submitted verbatim.' +
+        '\n  • Free text without / is dispatched to your default role (' + chalk.cyan(defaultRole) + ').'
+    );
+
+    console.log(boxen(
+        header + '\n\n' + sections.join('\n\n') + footer,
+        { padding: 1, borderStyle: 'round', borderColor: 'cyan', title: 'Help', titleAlignment: 'center' }
+    ));
 }
+ 

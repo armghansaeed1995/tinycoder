@@ -4,35 +4,43 @@ import chalk from 'chalk';
 import { promptForOverwrite } from '../ui/prompts.js';
 
 /**
- * Safely loads context files. Returns null if they don't exist.
+ * Safely loads context files. Returns null if the file does not exist or
+ * cannot be read.
  */
 export async function readContextFile(filename) {
     const filePath = path.join(process.cwd(), filename);
     try {
-        return await fs.readFile(filePath, 'utf-8');
+        const data = await fs.readFile(filePath, 'utf-8');
+        // Treat empty strings as `null` so callers can use a simple `if (!x)` check.
+        return data.length > 0 ? data : null;
     } catch (error) {
-        return null; 
+        return null;
     }
 }
 
 /**
  * Writes to TINYPLAN.md or TINYCONTEXT.md, asking for permission if necessary.
+ * Returns true if the file was written, false if the user skipped or an
+ * error occurred.
  */
 export async function writeContextFile(filename, content) {
     const filePath = path.join(process.cwd(), filename);
-    
+
     try {
-        // Check if file exists
+        // Check if file already exists; if so, prompt the user before clobbering.
         await fs.access(filePath);
-        
-        // If it does, ask the user what to do
+
         const overwrite = await promptForOverwrite(filename);
         if (!overwrite) {
             console.log(chalk.gray(`Skipped writing to ${filename}.`));
             return false;
         }
     } catch (error) {
-        // File doesn't exist, we can safely create it
+        // File doesn't exist (ENOENT) — safe to create without prompting.
+        if (error.code && error.code !== 'ENOENT') {
+            console.error(chalk.red(`Cannot access ${filename}: ${error.message}`));
+            return false;
+        }
     }
 
     try {

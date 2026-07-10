@@ -2,59 +2,87 @@ import fs from 'fs/promises';
 import path from 'path';
 
 /**
- * Reads local .gitignore and merges it with default heavy directories.
+ * Default heavy directories that the fuzzy finder should never recurse into.
+ * These are applied even when no .gitignore is present so the project layout
+ * stays usable on freshly-initialized repos.
+ */
+const DEFAULT_IGNORED = ['.git', 'node_modules', '.env', 'dist', 'build'];
+
+/**
+ * Reads the local .gitignore (if any) and merges its patterns with the
+ * built-in defaults. Comments and blank lines are stripped. Trailing
+ * directory markers (e.g. `build/`) are normalized.
  */
 async function getIgnoredPatterns(dir) {
-    const patterns = ['.git', 'node_modules', '.env', 'dist', 'build']; 
+    const patterns = [...DEFAULT_IGNORED];
     try {
         const gitignore = await fs.readFile(path.join(dir, '.gitignore'), 'utf-8');
-        const parsed = gitignore.split('\n')
-            .map(line => line.trim())
-            .filter(line => line && !line.startsWith('#'));
-        patterns.push(...parsed);
-    } catch (error) {
-        // No .gitignore found, proceed with defaults
+        for (const rawLine of gitignore.split('\n')) {
+            const line = rawLine.trim();
+            if (!line || line.startsWith('#') || line.startsWith('!')) continue;
+            // Strip trailing slash used in gitignore to denote directories only.
+            patterns.push(line.replace(/\/$/, ''));
+        }
+    } catch {
+        // No .gitignore found — proceed with defaults.
     }
     return patterns;
 }
 
 /**
- * Basic matcher to check if a file/folder should be skipped.
+ * Decide whether a file/folder should be skipped. Supports:
+ *   - Exact name matches (`.git`, `node_modules`)
+ *   - Glob wildcards (`*.log`)
+ *   - Path-prefix matches (`build/...`)
+ *
+ * Negation (`!pattern`) is intentionally not honored — we only *exclude*
+ * more from the default deny-list, never re-include.
  */
-function isIgnored(itemPath, patterns) {
+function isIgnored(itemPath, name, patterns) {
     return patterns.some(pattern => {
-        // Handle wildcards like *.log
+        if (!pattern) return false;
         if (pattern.startsWith('*.')) {
-            return itemPath.endsWith(pattern.slice(1));
+            return name.endsWith(pattern.slice(1));
         }
-        // Exact match or folder match
-        return itemPath === pattern || itemPath.startsWith(pattern + '/') || itemPath.startsWith(pattern + '\\');
+        // Exact name match
+        if (name === pattern) return true;
+        // Path-prefix match (handles both POSIX and Windows separators)
+        return itemPath === pattern
+            || itemPath.startsWith(pattern + '/');
     });
 }
 
 /**
- * Recursively gets all project files for the fuzzy finder.
+ * Recursively collects all project files under `dir` (defaults to cwd),
+ * respecting .gitignore and a small built-in deny-list. Symlinks are
+ * intentionally skipped to avoid infinite recursion on cycles.
  */
 export async function getProjectFiles(dir = process.cwd()) {
     const patterns = await getIgnoredPatterns(dir);
     const files = [];
 
     async function scan(currentDir, relativePath = '') {
-        const entries = await fs.readdir(currentDir, { withFileTypes: true });
+        let entries;
+        try {
+            entries = await fs.readdir(currentDir, { withFileTypes: true });
+        } catch {
+            // Unreadable directory (perms, EACCES, etc.) — just skip it.
+            return;
+        }
 
         for (const entry of entries) {
+            // Skip symlinks outright to avoid cycles and surprises.
+            if (entry.isSymbolicLink()) continue;
+
             const entryRelativePath = path.join(relativePath, entry.name);
-            
-            // Skip ignored files/directories
-            if (isIgnored(entryRelativePath, patterns) || isIgnored(entry.name, patterns)) {
-                continue;
-            }
+
+            if (isIgnored(entryRelativePath, entry.name, patterns)) continue;
 
             const fullPath = path.join(currentDir, entry.name);
 
             if (entry.isDirectory()) {
                 await scan(fullPath, entryRelativePath);
-            } else {
+            } else if (entry.isFile()) {
                 files.push(entryRelativePath);
             }
         }
