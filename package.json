@@ -1,0 +1,27 @@
+{
+  "name": "tinycoder",
+  "version": "1.0.0",
+  "description": "A lightning-fast, highly optimized local CLI coding assistant for 1-2B models.",
+  "main": "src/index.js",
+  "type": "module",
+  "bin": {
+    "tinycoder": "bin/tinycoder.js"
+  },
+  "scripts": {
+    "start": "node ./bin/tinycoder.js"
+  },
+  "keywords": [
+    "cli",
+    "llm",
+    "coding-assistant",
+    "ollama",
+    "local-ai"
+  ],
+  "author": "Armghan Saeed",
+  "license": "MIT",
+  "dependencies": {
+    "boxen": "^8.0.1",
+    "chalk": "^5.3.0",
+    "enquirer": "^2.4.1"
+  }
+}

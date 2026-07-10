@@ -1,0 +1,29 @@
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Optional local project configuration override
+# (Keep this ignored if it contains machine-specific pathing/endpoints)
+tinycoder.json
+
+# Local Generated Context Files
+# (These map out your active workspace and change constantly per machine)
+TINYCONTEXT.md
+TINYPLAN.md
+
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
